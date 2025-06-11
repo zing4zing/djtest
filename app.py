@@ -1338,16 +1338,25 @@ def extract_structured_from_text(text: str) -> pd.DataFrame:
 def collect_data_from_directions(directions: List[str]) -> pd.DataFrame:
     all_dfs = []
     progress = st.progress(0)
+    progress_text = st.empty()
     for i, d in enumerate(directions):
+        progress_text.text(f"正在检索: {d} ({i+1}/{len(directions)})")
         search_results = search_with_tavily(d)
+        found = False
         for result in search_results:
+            progress_text.text(f"正在爬取: {result['url']}")
             crawler = WebDataCrawler()
             df = crawler.crawl_data(result['url'])
             if df is not None and not df.empty:
                 df['source'] = result['url']
                 all_dfs.append(df)
+                found = True
+                progress_text.text(f"成功获取: {result['url']}")
                 break
+        if not found:
+            progress_text.text(f"未找到可用数据: {d}")
         progress.progress((i + 1) / len(directions))
+    progress_text.text("数据收集完成")
     progress.empty()
     if all_dfs:
         return pd.concat(all_dfs, ignore_index=True)
@@ -1363,7 +1372,7 @@ class WebDataCrawler:
     def crawl_data(self, url: str) -> pd.DataFrame:
         """爬取网页数据并转换为DataFrame"""
         try:
-            st.write("开始爬取数据...")
+            st.write(f"开始爬取数据: {url}")
             progress_bar = st.progress(0)
             
             # 发送请求获取页面内容
@@ -1400,8 +1409,13 @@ class WebDataCrawler:
             return df
             
         except Exception as e:
-            st.error(f"爬取失败: {str(e)}")
-            logger.error(f"爬取失败: {str(e)}")
+            msg = getattr(e, 'response', None)
+            if msg is not None:
+                err_detail = f"{msg.status_code} {msg.reason}"
+            else:
+                err_detail = str(e)
+            st.error(f"爬取失败: {err_detail}")
+            logger.error(f"爬取失败: {err_detail}")
             return pd.DataFrame()
 
 # Main Application
