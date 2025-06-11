@@ -25,7 +25,7 @@ from pyecharts.charts import TreeMap, Boxplot
 from pyecharts.globals import ThemeType
 from streamlit_echarts import st_pyecharts
 import numpy as np  # 确保导入numpy用于直方图计算
-from io import BytesIO
+from io import BytesIO, StringIO
 from docx import Document
 from docx.shared import Inches
 import base64
@@ -206,15 +206,29 @@ def data_collection_phase():
     
     # 如果已经完成数据收集方向生成，显示结果并隐藏输入框
     if st.session_state.data_collection_completed:
-        # 显示对话历史
         for message in st.session_state.data_conversation:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
-                
-        # 提醒用户收集数据并上传
-        st.info("👆 请参考上述数据收集方向指南，收集所需数据后通过左侧边栏上传，继续后续分析步骤。")
-        
-        # 添加刷新图标和提示，替代输入框
+
+        st.subheader("选择要自动收集的数据方向")
+        directions = re.findall(r"####\s*(.+)", st.session_state.data_directions)
+        if not directions:
+            directions = re.findall(r"-\s*(.+)", st.session_state.data_directions)
+        directions_input = st.text_area(
+            "一行一个数据方向，可自行修改", value="\n".join(directions)
+        )
+        if st.button("自动收集并整理数据"):
+            queries = [d.strip() for d in directions_input.splitlines() if d.strip()]
+            if queries:
+                df = collect_data_from_directions(queries)
+                if not df.empty:
+                    processor = DataProcessor(df)
+                    st.session_state['current_processor'] = processor
+                    st.session_state['data_uploaded'] = True
+                    st.success("已自动收集数据并载入")
+                else:
+                    st.warning("未能自动获取到结构化数据")
+
         refresh_col1, refresh_col2 = st.columns([1, 10])
         with refresh_col1:
             if st.button("🔄", help="重新生成数据收集方向"):
@@ -223,7 +237,7 @@ def data_collection_phase():
                 st.rerun()
         with refresh_col2:
             st.write("如需重新生成数据收集方向，请点击左侧刷新按钮")
-        
+
         return True
     
     # 当用户已经选择了选题，但还没有生成数据收集方向
@@ -1295,6 +1309,50 @@ def get_data_news_story(selected_charts):
         logger.error(f"生成数据新闻时出错: {str(e)}")
         return None
 
+# --- 新增功能：从文本中提取结构化数据 ---
+def extract_structured_from_text(text: str) -> pd.DataFrame:
+    """利用LLM将网页文本转换为结构化数据"""
+    try:
+        prompt = (
+            "请从下面的新闻文本中提取与统计数字相关的数据，"
+            "以CSV格式返回，第一行应为列名。\n\n" + text[:2000]
+        )
+        messages = [
+            {"role": "system", "content": "你擅长从中文新闻文本中提取表格数据并以CSV形式输出"},
+            {"role": "user", "content": prompt},
+        ]
+        response = client.chat_completions_create(messages)
+        if 'choices' in response and len(response['choices']) > 0:
+            csv_text = response['choices'][0]['message']['content']
+            try:
+                df = pd.read_csv(StringIO(csv_text))
+                return df
+            except Exception:
+                logger.error("解析CSV失败")
+                return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"结构化解析失败: {e}")
+    return pd.DataFrame()
+
+# 根据多个数据方向自动收集网络数据并合并
+def collect_data_from_directions(directions: List[str]) -> pd.DataFrame:
+    all_dfs = []
+    progress = st.progress(0)
+    for i, d in enumerate(directions):
+        search_results = search_with_tavily(d)
+        for result in search_results:
+            crawler = WebDataCrawler()
+            df = crawler.crawl_data(result['url'])
+            if df is not None and not df.empty:
+                df['source'] = result['url']
+                all_dfs.append(df)
+                break
+        progress.progress((i + 1) / len(directions))
+    progress.empty()
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    return pd.DataFrame()
+
 # 新增爬虫数据处理类
 class WebDataCrawler:
     def __init__(self):
@@ -1325,21 +1383,20 @@ class WebDataCrawler:
                 progress_bar.progress(1.0)
                 return df
             
-            # 如果没有表格，提取文本内容
+            # 如果没有表格，尝试从文本中提取结构化数据
             soup = BeautifulSoup(response.text, 'html.parser')
             text_content = soup.get_text()
-            df = pd.DataFrame({
-                'content': [text_content],
-                'url': [url],
-                'timestamp': [pd.Timestamp.now()]
-            })
-            
-            # 保存到session state
+            df = extract_structured_from_text(text_content)
+            if df is None or df.empty:
+                df = pd.DataFrame({
+                    'content': [text_content],
+                    'url': [url],
+                    'timestamp': [pd.Timestamp.now()]
+                })
             st.session_state['crawled_df'] = df
             progress_bar.progress(1.0)
             st.write("获取到的文本数据预览：")
             st.write(text_content[:500] + "...")
-            
             return df
             
         except Exception as e:
